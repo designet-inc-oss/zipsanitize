@@ -1,0 +1,267 @@
+#! /usr/bin/env php 
+<?php
+/*
+ * SaMMA zipsanitize plugin
+ *
+ * Copyright (C) 2017 DesigNET, INC.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
+
+###############################################################################
+# Initilized
+###############################################################################
+define("BASEDIR", dirname(dirname(__file__)));
+define("PROG", basename($argv[0]));
+
+###############################################################################
+# Include
+###############################################################################
+include(BASEDIR. "/class/Init.php");
+include(LIBDIR. "Config.php");
+include(LIBDIR. "Database.php");
+include(LIBDIR. "/vendor/div.php");
+
+###############################################################################
+# template
+###############################################################################
+define("TMPL", TMPLDIR. "url.tmpl");
+
+###############################################################################
+# Class
+###############################################################################
+
+Class connector {
+    private $base64_zipname = "";
+    private $org_zipfile    = "";
+    private $org_dir        = "";
+    private $tmpfilename    = "";
+    private $hash           = "";
+    private $time           = "";
+    private $c              = "";
+    private $db             = "";
+    private $enc_flag       = 0;
+    private $tags           = array();
+
+    public function __construct()
+    {
+        # Get now unix timestamp
+        $this->time = time();
+
+        # Read config
+        $this->c = new Config(CONFIG);
+        if ($this->c->result === false) {
+            throw new Exception('system error');
+        }
+        
+        # Start log.
+        if (openlog(PROG, LOG_PID,
+                constant($this->c->config["common"]["SyslogFacility"]))
+                                                                   === FALSE) {
+            syslog(LOG_ERR, "Failed openlog.");
+            throw new Exception('system error');
+        }
+
+        $db = new DB($this->c->config["database"]);
+        if ($db->result === false)  {
+            syslog(LOG_ERR,
+                   "Cannot connect database. Please see the log for details.");
+            throw new Exception('system error');
+        }
+        $this->db = $db;
+
+        # Get attachment zip file name from Environ.
+        if ($this->_getfname() === FALSE) {
+            throw new Exception('system error');
+        }
+
+        # Make hash(zipfilename + mypid + unixtime).
+        $this->_mkhash();
+
+        # Make original zip save dir.
+        if ($this->mkdir() === FALSE) {
+            throw new Exception('system error');
+        }
+
+        # Make original zip file.
+        if ($this->putzip() === FALSE) {
+            throw new Exception('system error');
+        }
+
+        # Check if encrypted ZIP
+        if ($this->checkenc() === FALSE) {
+            throw new Exception('system error');
+        }
+
+        # Add zipinfo
+        $data = [$this->hash, $this->time, $this->tmpfilename,
+                 $this->org_dir . "/" . $this->base64_zipname,
+                 null, 0, null, $this->enc_flag];
+        if ($this->addZipinfo($data) === FALSE) {
+            throw new Exception('system error');
+        }
+
+        # Print tmpfile
+        if ($this->printURL() === FALSE) {
+            throw new Exception('system error');
+        }
+    }
+
+    private function _getfname()
+    {
+        # Get file name
+        $filename = getenv("SAMMA_FILENAME");
+        if ($filename === FALSE || $filename == "") {
+            syslog(LOG_ERR, 'The name of the attached file is not defined.'.
+                                    ' There is a possibility of a SaMMA bug.');
+            return FALSE;
+        }
+        $this->tmpfilename = $filename;
+        $this->base64_zipname = base64_encode($filename);
+        syslog(LOG_INFO, 'Attachement file name(base64 encode): '.
+                                                     $this->base64_zipname);
+    }
+
+    private function _mkhash()
+    {
+        $data = $this->tmpfilename. getmypid(). $this->time;
+        $this->hash = hash('sha256', $data);
+
+        syslog(LOG_INFO, 'Make hash(filename:hash): '.
+                              $this->base64_zipname. ":". $this->hash);
+    }
+
+    private function mkdir()
+    {
+        $this->org_dir = $this->c->config["common"]["ZipSaveDir"] . $this->hash;
+        $this->org_zipfile = $this->org_dir . '/' . $this->base64_zipname;
+
+        # Make original zip save dir.
+        if (@mkdir($this->org_dir) === FALSE) {
+            $lasterr = error_get_last();
+            syslog(LOG_ERR, 'Cannot make directory: ' .
+                                        $this->org_dir . ': ' . $lasterr["message"]);
+            return FALSE;
+        }
+
+        $ret = chown($this->org_dir, $this->c->config["common"]["WebUser"]);
+        if ($ret === false) {
+            $lasterr = error_get_last();
+            syslog(LOG_ERR, 'Cannot change directory owner: ' .
+                                        $this->org_dir . ': ' . $lasterr["message"]);
+            return FALSE;
+        }
+    }
+
+    private function putzip()
+    {
+        while (feof(STDIN) === FALSE) {
+            $line[] = fgets(STDIN);
+        }
+
+        $fp = @fopen($this->org_zipfile, 'w');
+        if ($fp === FALSE) {
+            $lasterr = error_get_last();
+            syslog(LOG_ERR, 'Cannot open original zipfile: '.
+                              $this->org_zipfile . ': ' . $lasterr['message']);
+            return FALSE;
+        }
+        foreach ($line as $a) {
+            if (@fwrite($fp, $a) === FALSE) {
+                $lasterr = error_get_last();
+                syslog(LOG_ERR, 'Cannot make original zipfile: '.
+                              $this->org_zipfile . ': ' . $lasterr['message']);
+                fclose($fp);
+                return FALSE;
+            }
+        }
+        fclose($fp);
+
+        $ret = chown($this->org_zipfile, $this->c->config["common"]["WebUser"]);
+        if ($ret === false) {
+            $lasterr = error_get_last();
+            syslog(LOG_ERR, 'Cannot change directory owner: ' .
+                                        $this->org_dir . ': ' . $lasterr["message"]);
+            return FALSE;
+        }
+    }
+
+    private function checkenc()
+    {
+        # Check if encrypted ZIP
+        exec("zipinfo -v " . $this->org_zipfile . " 2>&1", $output, $ret);
+        if ($ret !== 0) {
+            $logmsg = implode(":", $output);
+            syslog(LOG_ERR, 'Failed to execute zipinfo command:'. $logmsg);
+            return FALSE;
+        }
+
+        foreach ($output as $one) {
+            $one = trim($one);
+            $pieces = preg_split("/[\s]+/", $one);
+            if ($pieces === FALSE) {
+                syslog(LOG_ERR, 'Failed to preg_split.');
+                return FALSE;
+            }
+            if ($pieces[0] === "file" && $pieces[1] === "security" &&
+                $pieces[2] === "status:" && $pieces[3] === "encrypted") {
+                $this->enc_flag = 1;
+            }
+        }
+    }
+
+    private function addZipinfo($data)
+    {
+        $this->db->addHash($data);
+        if ($this->db->result === false) {
+            return FALSE;
+        }
+    }
+
+    private function printURL()
+    {
+        # print tmpfile
+
+        $file = $this->tmpfilename;
+        $url  = $this->c->config["connector"]["URLPrefix"]
+                                                        . "?h=" . $this->hash;
+        $this->tags['file'] = $file;
+        $this->tags['url'] = $url;
+
+        $view = new div(TMPL, $this->tags);
+        if ($view == TMPL) {
+            syslog(LOG_ERR, 'Cannot read template file:'. TMPL);
+            return FALSE;
+        }
+        print $view;
+    }
+
+    public function __destruct()
+    {
+        closelog();
+    }
+}
+
+###############################################################################
+# Main
+###############################################################################
+
+try {
+    new connector();
+} catch (Exception $e) {
+    exit(1);
+}
+
+exit(0);

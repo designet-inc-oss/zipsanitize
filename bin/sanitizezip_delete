@@ -1,0 +1,102 @@
+#! /usr/bin/env php 
+<?php
+/*
+ * SaMMA zipsanitize plugin
+ *
+ * Copyright (C) 2017 DesigNET, INC.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
+
+###############################################################################
+# Initilized
+###############################################################################
+define("BASEDIR", dirname(dirname(__file__)));
+define("PROG", basename($argv[0]));
+
+###############################################################################
+# Include
+###############################################################################
+include(BASEDIR. "/class/Init.php");
+include(LIBDIR. "Config.php");
+include(LIBDIR. "Database.php");
+
+###############################################################################
+# Class
+###############################################################################
+
+class sndelete {
+    private $db;
+
+    public function __construct()
+    {
+        $now = time();
+
+        # Read config
+        $c = new Config(CONFIG);
+        if ($c->result === false) {
+            exit(1);
+        }
+
+        # Start log.
+        openlog(PROG, LOG_PID,
+                             constant($c->config["common"]["SyslogFacility"]));
+        
+        $db = new DB($c->config["database"]);
+        if ($db->result === false)  {
+            exit(1);
+        }
+        $this->db = $db;
+
+        $data = $this->db->allZipinfo();
+        try {
+            foreach ($data as $record) {
+                $limit = $record['create_date'] + ($c->config["zipdelete"]["SaveLimit"] * 82400);
+
+                if ($limit >= $now ) {
+                    continue;
+                }
+
+                $cmd = "rm -rf ". escapeshellarg($record['sanitized']);
+                exec($cmd, $output, $ret);
+                if ($ret != 0) {
+                    syslog(LOG_ERR, 'Cannot remove sanitized zip file:'.
+                             $record['sanitized']);
+                    exit(1);
+                }
+
+                $this->db->deleteHash($record['hash']);
+                if ($this->db->result === false) {
+                    syslog(LOG_ERR, 'Cannot remove zipinfo record:'.
+                             $record['hash']);
+                    exit(1);
+                }
+
+                $this->db->deleteQueueAll($record['hash']);
+                if ($this->db->result === false) {
+                    syslog(LOG_ERR, 'Cannot remove queue record:'.
+                             $record['hash']);
+                    exit(1);
+                }
+                 syslog(LOG_INFO, 'Remove sanitized zip:'.  $record['hash']);
+            }
+        } catch (PDOException $e) {
+            exit(1);
+        }
+    }
+}
+
+new sndelete();
+exit(0);

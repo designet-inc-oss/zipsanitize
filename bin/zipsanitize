@@ -1,0 +1,892 @@
+#! /usr/bin/env php 
+<?php
+/*
+ * SaMMA zipsanitize plugin
+ *
+ * Copyright (C) 2017 DesigNET, INC.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
+
+###############################################################################
+# Initilized
+###############################################################################
+define("BASEDIR", dirname(dirname(__file__)));
+define("PROG", basename($argv[0]));
+
+###############################################################################
+# Include
+###############################################################################
+include(BASEDIR. "/class/Init.php");
+
+set_include_path(get_include_path() . PATH_SEPARATOR . LIBDIR. "/vendor/" );
+include(LIBDIR. "Config.php");
+include(LIBDIR. "Database.php");
+include(LIBDIR. "Rule.php");
+include("div.php");
+include("Mail/mime.php");
+include("Mail/Mail.php");
+include("Mail/mail.php");
+
+
+###############################################################################
+# Class
+###############################################################################
+define("MAILTMPL", TMPLDIR. "/mail.tmpl");
+define("MAILWTMPL", TMPLDIR. "/mailwarn.tmpl");
+define("MAILETMPL", TMPLDIR. "/mailerror.tmpl");
+
+Class zipsanitize {
+    private $zipname = "";
+    private $hash = "";
+    private $password = "";
+    private $pwhash = "";
+    private $maddr = "";
+    private $zipinfo = [];
+    private $time = "";
+    private $sanitized_zip = "";
+    private $convres = true;
+    private $convfails = [];
+    private $orgdir;
+    private $sntdir;
+    private $extdir;
+    private $tags;
+    private $mtmpl = MAILETMPL;
+    private $msubject = "Failed to sanitize";
+    private $mfrom = "root@localhost";
+    private $config;
+    private $rule;
+    private $defrule;
+    private $db = null;
+    public $result = true;
+
+    public function __construct($hash, $maddr)
+    {
+        $convfails = "";
+        $this->time     = time();  # Unix time stamp
+        $this->hash     = $hash;   # zip hash
+        $this->maddr    = $maddr;  # mail address
+        $this->mtmpl = MAILTMPL;
+        $this->tags = ["errors"=>"", "hash"=>$hash];
+
+        # Read config and initilize database
+        $ret = $this->init();
+        if ($ret === false) {
+            $this->result = false;
+            return;
+        }
+
+        openlog(PROG, LOG_PID,
+                             constant($this->logfacility));
+
+        # Get password from env
+        $this->getpasswd();
+
+        # Get zipinfo 
+        $ret = $this->getzipinfo();
+        if ($ret === false) {
+            $this->result = false;
+            return;
+        }
+
+        # Judge status
+        switch ($this->zipinfo["status"]) {
+            ##################################################################
+            # unprocessed
+            ##################################################################
+            case '0':
+                # Update status 0->1
+                $this->db->updateStatus($this->hash, 1);
+                if ($this->db->result === false) {
+                    $this->result = false;
+                    return;
+                }
+ 
+                $ret = $this->mksntdir();
+                if ($ret === false) {
+                    $this->_rmrf($this->sntdir);
+                    $this->_rmrf($this->extdir);
+                    $this->db->updateStatus($this->hash, 0);
+                    $this->result = false;
+                    return;
+                }
+
+                $ret = $this->mkextdir();
+                if ($ret === false) {
+                    $this->_rmrf($this->sntdir);
+                    $this->_rmrf($this->extdir);
+                    $this->db->updateStatus($this->hash, 0);
+                    $this->result = false;
+                    return;
+                }
+        
+                # Extract zip file
+                $ret = $this->_extractZip($this->zipinfo["original"],
+                                          $this->zipinfo["type"]);
+                if ($ret === false) {
+                    $this->_rmrf($this->sntdir);
+                    $this->_rmrf($this->extdir);
+                    $this->db->updateStatus($this->hash, 0);
+                    $this->result = false;
+                    return;
+                }
+
+                $this->db->updatePwhash($this->hash, $this->pwhash);
+
+                # Add queue 
+                $ret = $this->addqueue();
+                if ($ret === false) {
+                    $this->_rmrf($this->sntdir);
+                    $this->_rmrf($this->extdir);
+                    $this->db->updateStatus($this->hash, 0);
+                    $this->result = false;
+                    return;
+                }
+
+                # Build sanitized zip save path
+                $newzip = $this->sntdir. "/".  $this->zipinfo["filename"];
+
+                $ret = $this->_sanitize($this->zipinfo["original"]);
+                if ($ret === false && $this->convres === false) {
+                    $this->db->updateStatus($this->hash, 0);
+                    $this->_rmrf($this->sntdir);
+                    $this->_rmrf($this->extdir);
+                    $this->result = false;
+                    return;
+                }
+
+                if ($ret === true && $this->convres === false) {
+                    $convfails = implode("\n", $this->convfails);
+
+                    if ($this->failedaction === "encrypt") {
+                        $this->password = $this->randompw();
+                        $this->zipinfo["type"] = 1;
+
+                        syslog(LOG_ERR, 'Because sanitization error occurred,'.
+                                        'it was encrypted with the following '.
+                                        'password:'. $this->hash. ':'.
+                                         $this->password. ':'.  $newzip); 
+                    }
+                }
+
+                # Re Archive files
+                $ret = $this->_archiveZip($newzip, $this->zipinfo["type"]);
+                if ($ret === false) {
+                    $this->db->updateStatus($hash, 0);
+                    $this->_rmrf($this->sntdir);
+                    $this->_rmrf($this->extdir);
+                    $this->result = false;
+                    return;
+                }
+
+                # Remove original zip file
+                $ret = @unlink($this->zipinfo["original"]);
+                if ($ret === false) {
+                    syslog(LOG_ERR, 'Cannot remove original zip file: '.
+                                          $this->zipinfo["original"]);
+                }
+
+                syslog(LOG_INFO, 'Put sanitized zip: '.
+                                          $this->zipinfo["original"]. "->".
+                                          $newzip);
+
+                $dbconvres = "true";
+                if ($this->convres === false) {
+                    $dbconvres = "false";
+                }
+
+                $this->db->updateSanitized($this->hash, time(), $newzip, 
+                                           $dbconvres, $convfails,
+                                           $this->pwhash);
+                $this->db->updateStatus($hash, 2);
+                $this->_rmrf($this->extdir);
+
+                # next case 3:
+
+            ##################################################################
+            # complete
+            ##################################################################
+            case '3':
+                # Get hash
+                $ret = $this->getzipinfo();
+                if ($ret === false) {
+                    $this->_rmrf($this->extdir);
+                    $this->result = false;
+                    return;
+                }
+
+                if ($this->zipinfo["type"] == "1") {
+                    if ($this->zipinfo["pwhash"] != $this->pwhash) {
+                        $this->result = false;
+                        syslog(LOG_ERR, 'Password does not match:hash:'. $this->hash);
+
+                        return;
+                    }
+                }
+
+                # Add queue 
+                $ret = $this->addqueue();
+                if ($ret === false) {
+                    $this->result = false;
+                    return;
+                }
+
+                if ($this->zipinfo["sanitize_result"] === "false") {
+                    # Change mail info
+                    $this->mtmpl = MAILWTMPL;
+                    $this->msubject = $this->mwsubject;
+                    $this->tags["errors"] = $this->zipinfo["sanitize_errors"];
+                }
+
+                # Get queue list
+                $queue = $this->db->queueByHash($this->hash);
+                if ($this->db->result === false) {
+                    $this->result = false;
+                    return;
+                }
+
+                foreach ($queue as $record) {
+                    # Send mail 
+                    $this->_sendMail($record["maddr"], true);
+
+                    # Delete queue
+                    $this->db->deleteQueue([$this->hash, $record["maddr"]]);
+                    if ($this->db->result === false) {
+                        $this->result = false;
+                        return;
+                    }
+                }
+
+                $this->db->updateStatus($this->hash, 3);
+
+                break;
+
+            ##################################################################
+            # now processing
+            ##################################################################
+            case '1':
+                if ($this->zipinfo["type"] == "1") {
+                    if ($this->zipinfo["pwhash"] == "") {
+                        sleep(30);
+                        # Get hash
+                        $ret = $this->getzipinfo();
+                        if ($ret === false) {
+                            $this->_rmrf($this->extdir);
+                            $this->result = false;
+                            return;
+                        }
+                    }
+
+                    if ($this->zipinfo["pwhash"] != $this->pwhash) {
+                        $this->result = false;
+                        syslog(LOG_ERR, 'Password does not match:hash:'. $this->hash);
+
+                        return;
+                    }
+                }
+
+                # Add queue 
+                $ret = $this->addqueue();
+                if ($ret === false) {
+                    $this->result = false;
+                    return;
+                }
+
+                syslog(LOG_ERR, 'Since the status is 1,'.
+                            'processing is terminated:hash:'. $this->hash);
+                break;
+
+            ##################################################################
+            # now mail sending
+            ##################################################################
+            case '2':
+                if ($this->zipinfo["type"] == "1") {
+                    if ($this->zipinfo["pwhash"] != $this->pwhash) {
+                        $this->result = false;
+                        syslog(LOG_ERR, 'Password does not match:hash:'. $this->hash);
+
+                        return;
+                    }
+                }
+
+                if ($this->zipinfo["sanitize_result"] === "false") {
+                    $this->mtmpl = MAILWTMPL;
+                    $this->msubject = $this->mwsubject;
+                    $this->tags["errors"] = $this->zipinfo["sanitize_errors"];
+                }
+
+
+                # Send mail 
+                $this->_sendMail($this->maddr, true);
+
+                # Delete queue
+                $this->db->deleteQueue([$this->hash, $this->maddr]);
+                if ($this->db->result === false) {
+                    $this->_rmrf($this->extdir);
+                    $this->result = false;
+                    return;
+                }
+
+                syslog(LOG_ERR, 'Since the status is 2,'.
+                            'sendmail one user:hash:'. $this->hash);
+ 
+                break;
+        }
+        $this->_rmrf($this->extdir);
+
+    }
+
+    private function init()
+    {
+        # Read config
+        $c = new Config(CONFIG);
+        if ($c->result === false) {
+            return false;
+        }
+
+        $this->sntdir = $c->config["common"]["SanitizeZIPSaveDir"]. "/". $this->hash;
+        $this->extdir = $c->config["common"]["TmpDir"]. "/". $this->hash.
+                                                                     time(). getmypid();
+        $this->mfrom = $c->config["zipsanitize"]["MailFrom"];
+        $this->msubject = $c->config["zipsanitize"]["MailSubject"];
+        $this->mwsubject = $c->config["zipsanitize"]["WarnMailSubject"];
+        $this->mesubject = $c->config["zipsanitize"]["ErrMailSubject"];
+        $this->zipfilemax = $c->config["zipsanitize"]["ZipFileMax"];
+        $this->failedaction = $c->config["zipsanitize"]["SanitizeFailedAction"];
+        $this->logfacility = $c->config["common"]["SyslogFacility"];
+
+        # Start log.
+        openlog(PROG, LOG_PID,
+                             constant($c->config["common"]["SyslogFacility"]));
+
+
+        # Read rule
+        $r = new Rule(RULE);
+        if ($r->result === false) {
+            return false;
+        }
+
+        $this->rule = $r->rule;
+        $this->defrule = $r->defrule;
+
+        # Connect database
+        $db = new DB($c->config["database"]);
+        if ($db->result === false)  {
+            return false;
+        }
+
+        $this->db = $db;
+
+        return true;
+    }
+
+    private function getpasswd()
+    {
+        # Get Password
+        $tmppass = getenv("SNZIPPASSWD");
+        if ($tmppass !== false) {
+            $this->password = $tmppass;
+            $this->pwhash = hash('sha256', $tmppass);
+        }
+    }
+
+    private function getzipinfo()
+    {
+        # Get hash
+        $zipinfo = $this->db->zipinfoByHash($this->hash);
+
+        # System error
+        $count = count($zipinfo);
+        if ($count === 0) {
+            syslog(LOG_ERR, 'There is no information in the zipinfo table.'.
+                             ' hash: '.  $this->hash);
+            return false;
+        }
+
+        # check status
+        $status = $zipinfo[0]["status"];
+        $ret = preg_match("/^[0-4]$/", $status);
+
+        # System error
+        if ($ret !== 1) {
+            syslog(LOG_ERR, 'Invalid zipinfo status('. $status.
+                                                 '). record hash: '. $this->hash);
+            return false;
+        }
+
+        # check maddr
+        $ret = filter_var($this->maddr, FILTER_VALIDATE_EMAIL);
+        if ($ret === false) {
+            syslog(LOG_ERR, 'Invalid mailaddress: '. $this->maddr);
+            return false;
+        }
+
+        # Save property
+        $this->zipinfo = $zipinfo[0];
+
+        return true;
+    }
+
+    private function addqueue()
+    {
+        # Check duplicate queue 
+        $queue = $this->db->queueByHashMaddr([$this->hash, $this->maddr]);
+        if (count($queue) === 0) {
+            # Add queue
+            $this->db->addQueue([$this->hash, $this->maddr]);
+
+            # System error
+            if ($this->db->result === false) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private function mkextdir()
+    {
+        # Make extract directory
+        $ret = @mkdir($this->extdir);
+        if ($ret === false) {
+            syslog(LOG_ERR, 'Cannot create extract dir: '. $this->extdir);
+            return false;
+        }
+
+        return true;
+    }
+
+    private function mksntdir()
+    {
+        # Make sanitized dir
+        $ret = @mkdir($this->sntdir);
+        if ($ret === false) {
+            syslog(LOG_ERR, 'Cannot create sanitize dir: '.
+                                                         $this->sntdir);
+            return false;
+        }
+        return true;
+    }
+
+
+
+    private function _archiveZip($newzip, $type)
+    {
+        # Set Option for extract zip
+        $opt = "-r ";
+        if ($type == 1) {
+            $opt = "-rP ". $this->password;
+        }
+
+        # Build command
+        putenv("ZIPOPT=$opt");
+        $cmd = "cd ". $this->extdir. "; ". "zip ". $newzip. " * 2>&1";
+
+        # Exec command
+        exec($cmd, $output, $return);
+        if ($return !== 0) {
+            $err = implode("", $output);
+            syslog(LOG_ERR, 'Could not archive zip file:'. $err. " : zip ". $opt. " ".
+                             $this->extdir);
+            return false;
+        }
+
+        return true;
+    }
+
+    private function _extractZip($zip, $type)
+    {
+        # Count zip file entries
+        $obj = new ZipArchive();
+        $ret = $obj->open($zip);
+        if ($ret === false) {
+            syslog(LOG_ERR, 'Could not open zip file:'. $err); 
+            return false;
+        }
+
+        # Compare entry limit
+        if ($obj->numFiles > $this->zipfilemax) {
+            syslog(LOG_ERR, 'There are too many entries in the zip file:'. 
+                             $zip. ":". $obj->numFiles); 
+            return false;
+        }
+
+        # Set Option for extract zip
+        $opt = " -O none ";
+        if ($type == 1) {
+            $opt = " -O none -P ". $this->password;
+        }
+
+        # Build command
+        putenv("UNZIPOPT=$opt");
+        $cmd = "cd ". $this->extdir. "; ". "unzip ". $zip.  " >/dev/null 2>&1";
+        # Exec command
+        exec($cmd, $output, $return);
+        if ($return !== 0) {
+            $err = implode("", $output);
+            syslog(LOG_ERR, 'Could extract zip file:'. $err. ":". $cmd); 
+            return false;
+        }
+        return true;
+    }
+
+    private function _sanitize($zip)
+    {
+        $list = array();
+        $fail = false;
+
+        # find extractdir
+        try { 
+            $iterator = new RecursiveDirectoryIterator($this->extdir);
+            $iterator = new RecursiveIteratorIterator($iterator);
+     
+            foreach ($iterator as $fileinfo) {
+                if ($fileinfo->isFile()) {
+                    $list[] = [
+                               $fileinfo->getPathname(), 
+                               $fileinfo->getExtension() 
+                              ];
+                }
+            }
+        } catch (Exception $e) {
+            $err = $e->getMessage();
+            syslog(LOG_ERR, 'Could find extract dir:'. $this->extdir. ":". $err); 
+            return false;
+        }
+
+        # file list loop
+        foreach ($list as $finfo) {
+            $path = $finfo[0];
+            $suffix = strtolower($finfo[1]);
+            $isproc = false;
+            
+            # match rule
+            foreach ($this->rule as $key => $val) {
+                $keys = array_keys($val);
+                $rule = $val[$keys[0]];
+
+                # If the extensions do not match, go to the next rule
+                if ($keys[0] !== $suffix) {
+                    continue;
+                }
+
+                $isproc = true;
+
+                if ($rule["cmd"] == "none"){
+                    break;
+                }
+
+                $ret = $this->_convert($zip, $path, $rule);
+
+                # Error to continue processing
+                if ($ret === true && $this->convres === false) {
+                    # convert path 
+                    $ignorelen = strlen($this->extdir);
+                    $this->convfails[] = substr($path, $ignorelen);
+                    continue;
+
+                # System error
+                } else if ($ret === true && $this->convres === false) {
+                    return false;
+                }
+            }
+
+            # If processed, continue
+            if ($isproc === true) {
+                continue;
+            }
+
+            # Default rule is not "none"
+            if ($this->defrule["cmd"] !== "none") {
+                $ret = $this->_convert($zip, $path, $this->defrule);
+                if ($ret === true && $this->convres === false) {
+                    # convert path 
+                    $ignorelen = strlen($this->extdir);
+                    $this->convfails[] = substr($path, $ignorelen);
+                    continue;
+                # System error
+                } else if ($ret === true && $this->convres === false) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private function _convert($zip, $path, $rule)
+    {
+        $tmpfile = $path. ".tmp";
+
+        # Open Pipe
+        $descriptorspec = array(
+             0 => array("pipe", "r"),    # for stdin
+             1 => array("file", $tmpfile, "w"), # for stdout
+             2 => array("pipe", "w")     # for stderr
+        );
+
+        $process = proc_open($rule["cmd"], $descriptorspec, $pipes);
+        if (is_resource($process) === false) {
+            @unlink($tmpfile);
+            syslog(LOG_ERR, 'Cannot exec command:'. $rule["cmd"]); 
+            $this->convres = false;
+            return false;
+        }
+
+        $fp = fopen($path, "r");
+        if ($fp === false) {
+            @unlink($tmpfile);
+            syslog(LOG_ERR, 'Cannot open target file:'. $path); 
+            $this->convres = false;
+            fclose($pipes[0]);
+            fclose($pipes[2]);
+            return false;
+        }
+
+        while ($data = fread($fp, 1024)) {
+            if ($data === false) {
+                break;
+            }
+
+            $ret = fwrite($pipes[0], $data);
+            if ($data === false) {
+                @unlink($tmpfile);
+                fclose($fp);
+                fclose($pipes[0]);
+                fclose($pipes[2]);
+                syslog(LOG_ERR, 'Cannot write tmp file:'. $tmpfile); 
+                $this->convres = false;
+                return false;
+            }
+        }
+
+        fclose($pipes[0]);
+
+        $cmderr = stream_get_contents($pipes[2]); 
+        fclose($pipes[2]);
+
+        if (feof($fp) === false) {
+            @unlink($tmpfile);
+            fclose($fp);
+            syslog(LOG_ERR, 'Cannot read file:'. $path); 
+            $this->convres = false;
+            return false;
+        }
+
+        fclose($fp);
+
+        $ret = proc_close($process);
+        if ($ret !== 0) {
+            @unlink($tmpfile);
+            syslog(LOG_ERR, 'Failed to command:'. $rule["cmd"]. ':'. $ret.
+                            ':'. $path. ":". $cmderr); 
+            $this->convres = false;
+            return true;
+        }
+
+        # 成功の場合は、もとのファイルを削除する
+        $ret = @unlink($path);
+        if ($ret === false) {
+            @unlink($tmpfile);
+            syslog(LOG_ERR, 'Cannot remove original file:'. $zip. ":". $path); 
+            $this->convres = false;
+            return false;
+        }
+
+        # ルールに合わせてファイル名を作成
+        if ($rule["convert"] == "-") {
+            $convertfile = $path;
+        } else {
+            $convertfile = $path. ".". $rule["convert"];
+        }
+
+        # ファイル名を変更
+        $ret = @rename($tmpfile, $convertfile);
+        if ($ret === false) {
+            @unlink($tmpfile);
+            syslog(LOG_ERR, 'Cannot rename file:'.
+                                             $tmpfile. "->". $convertfile); 
+            $this->convres = false;
+            return false;
+        }
+        return true;
+    }
+
+    private function _sendMail($to, $attachflg = false)
+    {
+        mb_internal_encoding("UTF-8");
+
+        $build_param = array(
+            "text_charset" => "UTF-8",
+            "head_charset" => "UTF-8",
+        );
+
+        # Mail_Mime
+        $mo = new Mail_Mime();
+
+        # Subject MIME encode(utf-8)
+        $msubject = mb_encode_mimeheader($this->msubject, "UTF-8", "B");
+
+        # From MIME encode(utf-8)
+        $mfrom = mb_encode_mimeheader($this->mfrom, "UTF-8", "Q");
+
+        # Add headers
+        $headers = ['From'=>$this->mfrom,
+                   'To'=>$to,
+                   'Subject'=>$this->msubject];
+
+        if ($attachflg === true) {
+            # create attchement file name
+#            $attachement = strftime($this->zipinfo['filename'], time());
+            $attachement =$this->zipinfo['filename'];
+
+            # Attachment file process
+            $mo->addAttachment($this->zipinfo["sanitized"],
+                               "application/zip",
+                               $attachement,
+                               true,
+                               "base64",
+                               "attachment",
+                               "UTF-8",
+                               "",
+                               "",
+                               "UTF-8",
+                               "UTF-8",
+                               "",
+                               "UTF-8"
+                              );
+
+            # Check attachment file
+            $mimepart = $mo->get($build_param);
+            if ($mimepart == NULL) {
+                syslog(LOG_ERR, 'Could not attach the zip file'. 
+                                        'after sanitize to mail.'. 
+                                        $this->zipinfo["sanitized"]);
+                return false;
+            }
+        }
+
+        # Get mail body
+        $text = new div($this->mtmpl, $this->tags);
+        if ($text == $this->mtmpl) {
+            syslog(LOG_ERR, 'Could not read mail template:'. $this->mtmpl);
+            return false;
+        }
+
+        # Set mail body
+        $mo->setTXTBody($text);
+
+        # Get body and headers
+        $body =  $mo->get($build_param);
+        $headers =  $mo->headers($headers);
+
+        #  Send mail
+        $mail =& Mail::factory('mail');
+        $mail->send($to, $headers, $body);
+
+        return true;
+    }
+
+    public function senderror($maddr)
+    {
+        if ($this->db !== null) {
+            # Get queue list
+            $queue = $this->db->queueByHash($this->hash);
+            if ($this->db->result === false) {
+                $this->_sendMail($maddr, false);
+                return;
+            }
+
+            foreach ($queue as $record) {
+                $this->mtmpl = MAILETMPL;
+                $this->msubject = $this->mesubject;
+                $this->_sendMail($record["maddr"], false);
+            }
+        } else {
+            $this->_sendMail($maddr, false);
+            return;
+        }
+    }
+
+    private function randompw()
+    {
+        $random = "";
+
+        for ($i = 0; $i < 2; $i++) {
+            $str = str_shuffle('1234567890'.
+                                  'abcdefghijklmnopqrstuvwxyz'.
+                                  'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.
+                                   '*+_?@$%=');
+            $random .= substr($str, 0, 6);
+        }
+
+        return $random;
+    }
+
+    private function _rmrf($dir)
+    {
+        if ($dir == "") {
+            return true;
+        }
+
+        $cnt = 0;
+        $handle = @opendir($dir);
+        if ($handle === false) {
+            return false;
+        }
+
+        while (($item = readdir($handle)) !== false) {
+            if ($item === "." || $item === "..") {
+                continue;
+            }
+
+            $path = $dir . "/" . $item;
+
+            if (is_dir($path) === true) {
+                $this->_rmrf($path);
+            } else {
+                $ret = @unlink($path);
+                if ($ret === false) {
+                    syslog(LOG_ERR, 'Could delete file:'. $path);
+                }
+            }
+        }
+        closedir($handle);
+
+        if (@rmdir($dir) === false) {
+            syslog(LOG_ERR, 'Could delete dirctory:'. $dir);
+            return false;
+        }
+
+        return true;
+    }
+
+    public function __destruct()
+    {
+        closelog();
+    }
+}
+
+if ($argc !== 3) {
+    syslog(LOG_ERR, 'Invalid argument.');
+    exit(1);
+}
+
+$obj = new zipsanitize($argv[1], $argv[2]);
+if ($obj->result === false) {
+    $obj->senderror($argv[2]);
+    exit(1);
+}
+exit(0);
+

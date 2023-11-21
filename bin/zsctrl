@@ -1,0 +1,347 @@
+#! /usr/bin/env php 
+<?php
+/*
+ * SaMMA zipsanitize plugin
+ *
+ * Copyright (C) 2017 DesigNET, INC.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+ */
+
+###############################################################################
+# Initilized
+###############################################################################
+define("BASEDIR", dirname(dirname(__file__)));
+
+###############################################################################
+# Include
+###############################################################################
+include(BASEDIR. "/class/Init.php");
+include(LIBDIR. "Config.php");
+include(LIBDIR. "Database.php");
+
+###############################################################################
+# Class
+###############################################################################
+
+class CTRL {
+    private $db;
+    private $c;
+
+    public function __construct()
+    {
+        # Read config
+        $c = new Config(CONFIG);
+        if ($c->result === false) {
+            echo "Cannot read config file. Please see the log for details.\n";
+            exit(1);
+        }
+        
+        $db = new DB($c->config["database"]);
+        if ($db->result === false)  {
+            echo "Cannot create DB table. Please see the log for details.\n";
+            exit(1);
+        }
+        $this->db = $db;
+        $this->c = $c;
+
+    }
+
+    public function init()
+    {
+        # Read config
+        $c = new Config(CONFIG);
+        if ($c->result === false) {
+            echo "Cannot read config file. Please see the log for details.\n";
+            exit(1);
+        }
+        $cmd = "mkdir -p ". $c->config["common"]["ZipSaveDir"]. " 2>&1";
+        exec($cmd, $output, $ret);
+        if ($ret != 0) {
+            $err = implode("", $output);
+            echo("Cannot create zipsavedir:".
+                           $c->config["common"]["ZipSaveDir"]. ":". $err. "\n");
+            exit(1);
+        }
+
+        $cmd = "mkdir -p ". $c->config["common"]["TmpDir"]. " 2>&1";
+
+        exec($cmd, $output, $ret);
+        if ($ret != 0) {
+            $err = implode("", $output);
+            echo("Cannot create tmpdir:".
+                               $c->config["common"]["TmpDir"]. ":". $err. "\n");
+            exit(1);
+        }
+
+        $cmd = "mkdir -p ". $c->config["common"]["SanitizeZIPSaveDir"]. " 2>&1";
+        exec($cmd, $output, $ret);
+        if ($ret != 0) {
+            $err = implode("", $output);
+            echo("Cannot create zip save dir:".
+                   $c->config["common"]["SanitizeZIPSaveDir"]. ":". $err. "\n");
+            exit(1);
+        }
+
+        $db = new DB($c->config["database"]);
+        if ($db->result === false)  {
+            echo "Cannot create DB table. Please see the log for details.\n";
+            exit(1);
+        }
+
+        $db->mkTable();
+
+        $dbdir = dirname($c->config["database"]["DB"]);
+
+        $cmd = "chmod 770 ".
+               $c->config["common"]["TmpDir"]. " ".
+               $c->config["common"]["ZipSaveDir"]. " ".
+               $c->config["common"]["SanitizeZIPSaveDir"]. " ".
+               $dbdir;
+
+        exec($cmd, $output, $ret);
+        if ($ret != 0) {
+            $err = implode("", $output);
+            echo("Cannot modify permission:". $err. "\n");
+            exit(1);
+        }
+
+        $cmd = "chmod -R o-rwx ". BASEDIR;
+        exec($cmd, $output, $ret);
+        if ($ret != 0) {
+            $err = implode("", $output);
+            echo("Cannot modify permission:". $err. "\n");
+            exit(1);
+        }
+
+        $webuser = $c->config["common"]["WebUser"];
+
+        $cmd = "chown -R ". $webuser. ":root ". BASEDIR. " ".
+               $c->config["common"]["TmpDir"].
+               " ". $c->config["common"]["SanitizeZIPSaveDir"]. " ".
+               $c->config["common"]["SanitizeZIPSaveDir"]. " ".
+               $dbdir;
+
+        exec($cmd, $output, $ret);
+        if ($ret != 0) {
+            $err = implode("", $output);
+            echo("Cannot modify owner:". $err. "\n");
+            exit(1);
+        }
+
+    }
+
+    public function listZipinfo($cols)
+    {
+        try {
+            $data = $this->db->allZipinfo($cols);
+        } catch (Exception $e) {
+            $this->result = false;
+            $err = $e->getMessage();
+            echo('Cannot search data from zipinfo table: '. $err. "\n");
+            exit(1);
+        }
+
+        if ($cols == "") {
+            echo("hash,create_date,filename,original,sanitized,status,stmodify_date,sanitize_date,sanitize_result,sanitize_errors,pwhash,type\n");
+        } else {
+            echo($cols. "\n");
+        }
+        foreach ($data as $record) {
+            echo(implode(",", array_values($record)). "\n");
+        }
+    }
+
+    public function addZipinfo($data)
+    {
+        try {
+            $this->db->addHash($data);
+            if ($this->db->result === false) {
+                echo("Fail\n");
+                exit(1);
+            }
+            echo("Success\n");
+        } catch (PDOException $e) {
+            exit(1);
+        }
+    }
+
+    public function deleteZipinfo($hash)
+    {
+        try {
+            $this->db->deleteHash($hash);
+            if ($this->db->result === false) {
+                echo("Cannot delete data from zipinfo table.\n");
+                exit(1);
+            }
+            echo("Delete success.\n");
+        } catch (PDOException $e) {
+            exit(1);
+        }
+    }
+
+    public function listQueue()
+    {
+        try {
+            $this->db->allQueue();
+        } catch (PDOException $e) {
+            exit(1);
+        }
+        $data = $this->db->allQueue();
+        echo("hash,maddr\n");
+        foreach ($data as $record) {
+            echo(implode(",", array_values($record)). "\n");
+        }
+    }
+
+    public function addQueue($data)
+    {
+        try {
+            $this->db->addQueue($data);
+            if ($this->db->result === false) {
+                echo("Fail.\n");
+                exit(1);
+            }
+            
+            echo("Success\n");
+        } catch (PDOException $e) {
+            exit(1);
+        }
+    }
+
+    public function deleteQueue($hash, $maddr)
+    {
+        try {
+            $this->db->deleteQueue([$hash, $maddr]);
+            if ($this->db->result === false) {
+                echo("Cannot delete data from queue table.\n");
+                exit(1);
+            }
+            echo("Delete success.\n");
+        } catch (PDOException $e) {
+            exit(1);
+        }
+    }
+
+    public function usage()
+    {
+        echo "Usage: zsctrl [init|list|add|delete] [zipinfo|queue] [hash]\n\n";
+        echo "init:   Initilized database.\n\n";
+        echo "list:   list of registered information.\n";
+        echo "           ex:$ zsctrl list zipinfo\n";
+        echo "           ex:$ zsctrl list queue\n\n";
+        echo "add:    add zipinfo or queue.";
+        echo "this option is for development.\n\n";
+        echo "delete: delete zipinfo or queue.\n";
+        echo "           ex:$ zsctrl delete zipinfo a0194vf...\n";
+        echo "           ex:$ zsctrl delete queue a0194vf... user01@example.com\n";
+    }
+
+}
+
+
+if ($argc < 2) {
+    CTRL::usage();
+    exit(1);
+}
+
+
+switch ($argv[1]) {
+    case 'init':
+        if ($argc != 2) {
+            CTRL::usage();
+            break;
+        }
+
+        CTRL::init();
+        break;
+
+    case 'list':
+        $ctrl = new CTRL();
+
+        if ($argc < 3) {
+            $ctrl->usage();
+            break;
+        }
+
+        $cols = "";
+        if (isset($argv[3])) {
+            $cols = $argv[3];
+        }
+
+        if ($argv[2] == "zipinfo") {
+
+            $ctrl->listZipinfo($cols);
+            break;
+        }
+
+        if ($argv[2] == "queue") {
+            $ctrl->listQueue($cols);
+            break;
+        }
+        break;
+
+    case 'add':
+        $ctrl = new CTRL();
+        if ($argc < 3) {
+            $ctrl->usage();
+            break;
+        }
+
+        $data = array_slice($argv, 3);
+        if ($argv[2] == "zipinfo") {
+            $ctrl->addZipinfo($data);
+            break;
+        }
+
+        if ($argv[2] == "queue") {
+            $ctrl->addQueue($data);
+            break;
+        }
+        break;
+
+    case 'delete':
+        $ctrl = new CTRL();
+        if ($argc < 3) {
+            $ctrl->usage();
+            break;
+        }
+
+        $data = array_slice($argv, 3);
+        if ($argv[2] == "zipinfo") {
+            if ($argc !== 4) {
+                $ctrl->usage();
+                break;
+            }
+
+            $ctrl->deleteZipinfo($argv[3]);
+            break;
+        }
+
+        if ($argv[2] == "queue") {
+            if ($argc !== 5) {
+                $ctrl->usage();
+                break;
+            }
+            $ctrl->deleteQueue($argv[3], $argv[4]);
+            break;
+        }
+        break;
+
+    default:
+        $ctrl->usage();
+}
+
+exit(0);

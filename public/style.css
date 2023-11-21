@@ -1,0 +1,14 @@
+.ErrorMessage {
+  color: red;
+  text-align: center;
+}
+.Message {
+  text-align: center;
+}
+.navbar-brand {
+  background: url("images/logo_samma.png") no-repeat left center;
+  background-size: contain;
+  height: 45px;
+  width: 140px;
+  margin-top:10px;
+}
